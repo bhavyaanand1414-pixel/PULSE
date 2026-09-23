@@ -11,6 +11,7 @@ from schemas import (
     AnomalyResponse,
 )
 from detection import run_zscore_detection
+from ml_detection import run_isolation_forest_detection
 
 app = FastAPI(title="PULSE API")
 
@@ -297,3 +298,82 @@ def get_anomalies_by_endpoint(
     query = query.order_by(Anomaly.timestamp.desc())
 
     return query.all()
+
+
+@app.post("/anomalies/detect/ml/{endpoint_id}")
+def detect_anomalies_ml(endpoint_id: int, db: Session = Depends(get_db)):
+    """
+    Trigger Isolation Forest (ML) anomaly detection for an endpoint.
+
+    Unlike Z-score which checks one metric at a time, Isolation Forest
+    analyzes response_time, error_rate, and request_count TOGETHER
+    to find multi-dimensional anomalies.
+    """
+    endpoint = db.query(Endpoint).filter(Endpoint.id == endpoint_id).first()
+    if not endpoint:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    try:
+        new_anomalies = run_isolation_forest_detection(db, endpoint_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    severity_counts = {}
+    for a in new_anomalies:
+        severity_counts[a.severity] = severity_counts.get(a.severity, 0) + 1
+
+    return {
+        "endpoint_id": endpoint_id,
+        "endpoint_name": endpoint.name,
+        "detection_method": "isolation_forest",
+        "new_anomalies_detected": len(new_anomalies),
+        "by_severity": severity_counts,
+    }
+
+
+@app.post("/anomalies/detect/hybrid/{endpoint_id}")
+def detect_anomalies_hybrid(endpoint_id: int, db: Session = Depends(get_db)):
+    """
+    Run BOTH Z-score AND Isolation Forest detection for an endpoint.
+
+    This hybrid approach gives the most comprehensive anomaly coverage:
+    - Z-score catches single-metric outliers (e.g., one huge latency spike)
+    - Isolation Forest catches multi-dimensional patterns (e.g., moderate
+      latency + moderate errors + traffic spike = combined anomaly)
+
+    Results from both methods are stored separately with their detection_method
+    field, so you can filter and compare them later.
+    """
+    endpoint = db.query(Endpoint).filter(Endpoint.id == endpoint_id).first()
+    if not endpoint:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    try:
+        zscore_anomalies = run_zscore_detection(db, endpoint_id)
+        ml_anomalies = run_isolation_forest_detection(db, endpoint_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Build severity counts for each method
+    zscore_counts = {}
+    for a in zscore_anomalies:
+        zscore_counts[a.severity] = zscore_counts.get(a.severity, 0) + 1
+
+    ml_counts = {}
+    for a in ml_anomalies:
+        ml_counts[a.severity] = ml_counts.get(a.severity, 0) + 1
+
+    return {
+        "endpoint_id": endpoint_id,
+        "endpoint_name": endpoint.name,
+        "detection_method": "hybrid",
+        "z_score": {
+            "new_anomalies": len(zscore_anomalies),
+            "by_severity": zscore_counts,
+        },
+        "isolation_forest": {
+            "new_anomalies": len(ml_anomalies),
+            "by_severity": ml_counts,
+        },
+        "total_new_anomalies": len(zscore_anomalies) + len(ml_anomalies),
+    }

@@ -113,3 +113,47 @@ class AnomalyResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
+
+# --- Incident Schemas ---
+
+class IncidentCreate(BaseModel):
+    """
+    Schema for creating a new incident.
+    The client provides a title, severity, endpoint, and optional description.
+    Status defaults to OPEN. Timestamps are auto-set by the server.
+    """
+    title: str
+    description: Optional[str] = None
+    severity: str               # LOW, MEDIUM, HIGH, CRITICAL
+    endpoint_id: int
+
+
+class IncidentUpdate(BaseModel):
+    """
+    Schema for updating an existing incident.
+
+    All fields are Optional — you only send what you want to change.
+    This is called a "partial update" pattern.
+    Example: to mark as resolved, send {"status": "RESOLVED"}
+    """
+    title: Optional[str] = None
+    description: Optional[str] = None
+    severity: Optional[str] = None
+    status: Optional[str] = None    # OPEN, INVESTIGATING, RESOLVED
+
+
+class IncidentResponse(BaseModel):
+    """
+    Schema for returning incident data to the client.
+    """
+    id: int
+    title: str
+    description: Optional[str]
+    severity: str
+    status: str
+    endpoint_id: int
+    created_at: datetime
+    updated_at: datetime
+    resolved_at: Optional[datetime]
+
+    model_config = {"from_attributes": True}

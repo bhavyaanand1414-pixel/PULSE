@@ -1,14 +1,16 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import text, func
 from datetime import datetime, timezone
 from typing import Optional
 
 from database import get_db
-from models import Endpoint, Metric, Anomaly
+from models import Endpoint, Metric, Anomaly, Incident
 from schemas import (
     EndpointCreate, EndpointResponse,
     MetricCreate, MetricResponse,
     AnomalyResponse,
+    IncidentCreate, IncidentUpdate, IncidentResponse,
 )
 from detection import run_zscore_detection
 from ml_detection import run_isolation_forest_detection
@@ -376,4 +378,179 @@ def detect_anomalies_hybrid(endpoint_id: int, db: Session = Depends(get_db)):
             "by_severity": ml_counts,
         },
         "total_new_anomalies": len(zscore_anomalies) + len(ml_anomalies),
+    }
+
+
+# --- Incident Management APIs ---
+
+@app.post("/incidents", response_model=IncidentResponse, status_code=201)
+def create_incident(incident_data: IncidentCreate, db: Session = Depends(get_db)):
+    """
+    Create a new incident to track an issue.
+
+    An incident starts in OPEN status. You can later update it to
+    INVESTIGATING or RESOLVED.
+    """
+    # Verify the endpoint exists
+    endpoint = db.query(Endpoint).filter(Endpoint.id == incident_data.endpoint_id).first()
+    if not endpoint:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    now = datetime.now(timezone.utc)
+    new_incident = Incident(
+        title=incident_data.title,
+        description=incident_data.description,
+        severity=incident_data.severity.upper(),
+        status="OPEN",
+        endpoint_id=incident_data.endpoint_id,
+        created_at=now,
+        updated_at=now,
+        resolved_at=None,
+    )
+    db.add(new_incident)
+    db.commit()
+    db.refresh(new_incident)
+    return new_incident
+
+
+@app.get("/incidents", response_model=list[IncidentResponse])
+def list_incidents(
+    status: Optional[str] = Query(None, description="Filter by status: OPEN, INVESTIGATING, RESOLVED"),
+    severity: Optional[str] = Query(None, description="Filter by severity"),
+    db: Session = Depends(get_db),
+):
+    """
+    List all incidents, optionally filtered by status and/or severity.
+    Returns newest first.
+    """
+    query = db.query(Incident)
+
+    if status:
+        query = query.filter(Incident.status == status.upper())
+    if severity:
+        query = query.filter(Incident.severity == severity.upper())
+
+    query = query.order_by(Incident.created_at.desc())
+    return query.all()
+
+
+@app.get("/incidents/{incident_id}", response_model=IncidentResponse)
+def get_incident(incident_id: int, db: Session = Depends(get_db)):
+    """Get a single incident by ID."""
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return incident
+
+
+@app.put("/incidents/{incident_id}", response_model=IncidentResponse)
+def update_incident(
+    incident_id: int,
+    update_data: IncidentUpdate,
+    db: Session = Depends(get_db),
+):
+    """
+    Update an existing incident (partial update).
+
+    Only fields that are provided in the request body will be changed.
+    This uses the "partial update" pattern — send only what you want to change.
+
+    Example: PUT /incidents/1 with {"status": "INVESTIGATING"}
+    will only change the status, leaving title/description/severity unchanged.
+
+    If status is changed to RESOLVED, resolved_at is automatically set.
+    """
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    # model_dump(exclude_unset=True) returns only the fields the client sent
+    update_fields = update_data.model_dump(exclude_unset=True)
+
+    for field, value in update_fields.items():
+        if field == "status" and value:
+            value = value.upper()
+        if field == "severity" and value:
+            value = value.upper()
+        setattr(incident, field, value)
+
+    # Auto-set resolved_at when status changes to RESOLVED
+    if incident.status == "RESOLVED" and incident.resolved_at is None:
+        incident.resolved_at = datetime.now(timezone.utc)
+
+    # If re-opened, clear resolved_at
+    if incident.status != "RESOLVED":
+        incident.resolved_at = None
+
+    incident.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(incident)
+    return incident
+
+
+@app.post("/incidents/{incident_id}/resolve", response_model=IncidentResponse)
+def resolve_incident(incident_id: int, db: Session = Depends(get_db)):
+    """
+    Quick-resolve an incident. Sets status to RESOLVED and timestamps it.
+
+    This is a convenience endpoint — you could also use PUT with
+    {"status": "RESOLVED"}, but this is cleaner for the frontend.
+    """
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    now = datetime.now(timezone.utc)
+    incident.status = "RESOLVED"
+    incident.resolved_at = now
+    incident.updated_at = now
+    db.commit()
+    db.refresh(incident)
+    return incident
+
+
+# --- System Health ---
+
+@app.get("/system/health")
+def system_health(db: Session = Depends(get_db)):
+    """
+    Comprehensive system health check.
+
+    Unlike the simple /health endpoint, this actually verifies:
+    1. The database connection is alive (runs a real SQL query)
+    2. Reports counts of monitored endpoints, metrics, anomalies, incidents
+
+    If the database is down, this endpoint will report it honestly
+    rather than falsely claiming everything is healthy.
+    """
+    # Test database connection with a simple query
+    try:
+        db.execute(text("SELECT 1"))
+        db_status = "connected"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+
+    # Gather real statistics
+    try:
+        endpoint_count = db.query(func.count(Endpoint.id)).scalar()
+        metric_count = db.query(func.count(Metric.id)).scalar()
+        anomaly_count = db.query(func.count(Anomaly.id)).scalar()
+        open_incidents = db.query(func.count(Incident.id)).filter(
+            Incident.status != "RESOLVED"
+        ).scalar()
+    except Exception:
+        endpoint_count = metric_count = anomaly_count = open_incidents = "unavailable"
+
+    overall = "healthy" if db_status == "connected" else "unhealthy"
+
+    return {
+        "status": overall,
+        "service": "PULSE API",
+        "database": db_status,
+        "stats": {
+            "monitored_endpoints": endpoint_count,
+            "total_metrics": metric_count,
+            "total_anomalies": anomaly_count,
+            "open_incidents": open_incidents,
+        },
     }

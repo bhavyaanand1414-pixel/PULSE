@@ -4,11 +4,13 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from database import get_db
-from models import Endpoint, Metric
+from models import Endpoint, Metric, Anomaly
 from schemas import (
     EndpointCreate, EndpointResponse,
     MetricCreate, MetricResponse,
+    AnomalyResponse,
 )
+from detection import run_zscore_detection
 
 app = FastAPI(title="PULSE API")
 
@@ -193,5 +195,105 @@ def get_metrics_by_endpoint(
         query = query.filter(Metric.timestamp <= end_time)
 
     query = query.order_by(Metric.timestamp.desc())
+
+    return query.all()
+
+
+# --- Anomaly Detection APIs ---
+
+@app.post("/anomalies/detect/{endpoint_id}")
+def detect_anomalies(endpoint_id: int, db: Session = Depends(get_db)):
+    """
+    Trigger Z-score anomaly detection for a specific endpoint.
+
+    How it works:
+    1. Fetches all historical metrics for this endpoint.
+    2. Calculates the baseline (mean + standard deviation) for each metric type.
+    3. Computes the Z-score for every observation.
+    4. If |Z-score| >= 2.0, flags it as an anomaly with the appropriate severity.
+    5. Saves new anomalies to the database (skips already-detected ones).
+
+    Returns a summary of how many anomalies were found per severity level.
+    """
+    endpoint = db.query(Endpoint).filter(Endpoint.id == endpoint_id).first()
+    if not endpoint:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    try:
+        new_anomalies = run_zscore_detection(db, endpoint_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Build a summary grouped by severity
+    severity_counts = {}
+    for a in new_anomalies:
+        severity_counts[a.severity] = severity_counts.get(a.severity, 0) + 1
+
+    return {
+        "endpoint_id": endpoint_id,
+        "endpoint_name": endpoint.name,
+        "detection_method": "z_score",
+        "new_anomalies_detected": len(new_anomalies),
+        "by_severity": severity_counts,
+    }
+
+
+@app.get("/anomalies", response_model=list[AnomalyResponse])
+def list_anomalies(
+    severity: Optional[str] = Query(None, description="Filter by severity: LOW, MEDIUM, HIGH, CRITICAL"),
+    detection_method: Optional[str] = Query(None, description="Filter by method: z_score, isolation_forest"),
+    start_time: Optional[datetime] = Query(None, description="Filter anomalies after this time"),
+    end_time: Optional[datetime] = Query(None, description="Filter anomalies before this time"),
+    db: Session = Depends(get_db),
+):
+    """
+    List all detected anomalies, with optional filters.
+
+    Supports filtering by severity, detection method, and time range.
+    Returns newest anomalies first.
+    """
+    query = db.query(Anomaly)
+
+    if severity:
+        query = query.filter(Anomaly.severity == severity.upper())
+    if detection_method:
+        query = query.filter(Anomaly.detection_method == detection_method)
+    if start_time:
+        query = query.filter(Anomaly.timestamp >= start_time)
+    if end_time:
+        query = query.filter(Anomaly.timestamp <= end_time)
+
+    query = query.order_by(Anomaly.timestamp.desc())
+
+    return query.all()
+
+
+@app.get("/anomalies/{endpoint_id}", response_model=list[AnomalyResponse])
+def get_anomalies_by_endpoint(
+    endpoint_id: int,
+    severity: Optional[str] = Query(None, description="Filter by severity"),
+    start_time: Optional[datetime] = Query(None, description="Filter after this time"),
+    end_time: Optional[datetime] = Query(None, description="Filter before this time"),
+    db: Session = Depends(get_db),
+):
+    """
+    Get all anomalies for a specific endpoint.
+
+    Useful for investigating one service's anomaly history.
+    """
+    endpoint = db.query(Endpoint).filter(Endpoint.id == endpoint_id).first()
+    if not endpoint:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    query = db.query(Anomaly).filter(Anomaly.endpoint_id == endpoint_id)
+
+    if severity:
+        query = query.filter(Anomaly.severity == severity.upper())
+    if start_time:
+        query = query.filter(Anomaly.timestamp >= start_time)
+    if end_time:
+        query = query.filter(Anomaly.timestamp <= end_time)
+
+    query = query.order_by(Anomaly.timestamp.desc())
 
     return query.all()

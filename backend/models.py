@@ -31,6 +31,7 @@ class Endpoint(Base):
     # cascade="all, delete-orphan" means: if you delete an Endpoint,
     # automatically delete all its Metrics too (no orphan data).
     metrics = relationship("Metric", back_populates="endpoint", cascade="all, delete-orphan")
+    anomalies = relationship("Anomaly", back_populates="endpoint", cascade="all, delete-orphan")
 
 
 class Metric(Base):
@@ -66,3 +67,42 @@ class Metric(Base):
 
     # back_populates creates the reverse link: metric.endpoint gives the Endpoint object.
     endpoint = relationship("Endpoint", back_populates="metrics")
+
+
+class Anomaly(Base):
+    """
+    Stores a detected anomaly — a metric observation that deviates
+    significantly from the expected/baseline behavior.
+
+    Fields:
+    - endpoint_id: which endpoint the anomaly was found on
+    - metric_id: the specific metric observation that was anomalous
+    - metric_type: what was anomalous ("response_time", "error_rate", "request_count")
+    - observed_value: the actual value that was measured
+    - expected_value: what the baseline/average value is
+    - anomaly_score: how far off the value is (Z-score for statistical detection)
+    - severity: LOW / MEDIUM / HIGH / CRITICAL
+    - detection_method: which algorithm found it ("z_score", "isolation_forest", etc.)
+    - description: human-readable explanation of the anomaly
+    - timestamp: when the anomalous observation occurred
+    - detected_at: when PULSE detected it
+    """
+    __tablename__ = "anomalies"
+
+    id = Column(Integer, primary_key=True)
+    endpoint_id = Column(Integer, ForeignKey("endpoints.id"), nullable=False)
+    metric_id = Column(Integer, ForeignKey("metrics.id"), nullable=True)
+
+    metric_type = Column(String, nullable=False)        # "response_time", "error_rate", "request_count"
+    observed_value = Column(Float, nullable=False)       # What was actually measured
+    expected_value = Column(Float, nullable=False)       # What the baseline/average is
+    anomaly_score = Column(Float, nullable=False)        # Z-score or anomaly score
+    severity = Column(String, nullable=False)            # LOW, MEDIUM, HIGH, CRITICAL
+    detection_method = Column(String, nullable=False)    # "z_score", "isolation_forest", "hybrid"
+    description = Column(String, nullable=True)          # Human-readable explanation
+
+    timestamp = Column(DateTime, nullable=False)         # When the anomalous metric was recorded
+    detected_at = Column(DateTime, nullable=False)       # When PULSE found it
+
+    endpoint = relationship("Endpoint", back_populates="anomalies")
+

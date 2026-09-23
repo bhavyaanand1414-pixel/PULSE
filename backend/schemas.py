@@ -86,3 +86,30 @@ class MetricResponse(BaseModel):
     error_count: int
 
     model_config = {"from_attributes": True}
+
+
+# --- Anomaly Schemas ---
+
+class AnomalyResponse(BaseModel):
+    """
+    Schema for returning a detected anomaly.
+
+    This is what the API sends back when you query anomalies.
+    Includes all detection details: what was unusual, how unusual,
+    and which algorithm detected it.
+    """
+    id: int
+    endpoint_id: int
+    metric_id: Optional[int]
+    metric_type: str            # "response_time", "error_rate", "request_count"
+    observed_value: float       # The actual measured value
+    expected_value: float       # The baseline/average value
+    anomaly_score: float        # Z-score (how many std deviations away)
+    severity: str               # LOW, MEDIUM, HIGH, CRITICAL
+    detection_method: str       # "z_score", "isolation_forest", "hybrid"
+    description: Optional[str]  # Human-readable explanation
+    timestamp: datetime
+    detected_at: datetime
+
+    model_config = {"from_attributes": True}
+

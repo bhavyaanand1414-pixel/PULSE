@@ -1,18 +1,14 @@
-"""
-PULSE API — Main application entry point.
-
-This file defines all the API routes (endpoints) for the PULSE platform.
-FastAPI handles HTTP requests and uses dependency injection to get
-database sessions via get_db().
-"""
-
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
+from typing import Optional
 
 from database import get_db
-from models import Endpoint
-from schemas import EndpointCreate, EndpointResponse
+from models import Endpoint, Metric
+from schemas import (
+    EndpointCreate, EndpointResponse,
+    MetricCreate, MetricResponse,
+)
 
 app = FastAPI(title="PULSE API")
 
@@ -101,3 +97,101 @@ def delete_endpoint(endpoint_id: int, db: Session = Depends(get_db)):
     db.delete(endpoint)
     db.commit()
     return {"message": f"Endpoint '{endpoint.name}' deleted successfully"}
+
+
+# --- Metrics APIs ---
+
+@app.post("/metrics", response_model=MetricResponse, status_code=201)
+def create_metric(metric_data: MetricCreate, db: Session = Depends(get_db)):
+    """
+    Record a new API performance metric.
+
+    How it works:
+    1. Validate the request body using MetricCreate schema.
+    2. Check that the referenced endpoint actually exists (integrity check).
+    3. Create the Metric row with the current UTC timestamp.
+    4. Save it to PostgreSQL and return the saved object.
+    """
+    # First, verify the endpoint exists
+    endpoint = db.query(Endpoint).filter(Endpoint.id == metric_data.endpoint_id).first()
+    if not endpoint:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Endpoint with id {metric_data.endpoint_id} not found"
+        )
+
+    new_metric = Metric(
+        endpoint_id=metric_data.endpoint_id,
+        timestamp=datetime.now(timezone.utc),
+        response_time=metric_data.response_time,
+        status_code=metric_data.status_code,
+        is_error=metric_data.is_error,
+        request_count=metric_data.request_count,
+        error_count=metric_data.error_count,
+    )
+    db.add(new_metric)
+    db.commit()
+    db.refresh(new_metric)
+    return new_metric
+
+
+@app.get("/metrics", response_model=list[MetricResponse])
+def list_metrics(
+    start_time: Optional[datetime] = Query(None, description="Filter metrics after this time (ISO format)"),
+    end_time: Optional[datetime] = Query(None, description="Filter metrics before this time (ISO format)"),
+    db: Session = Depends(get_db),
+):
+    """
+    List all metrics, optionally filtered by time range.
+
+    Query parameters (both optional):
+    - start_time: Only return metrics recorded after this timestamp.
+    - end_time: Only return metrics recorded before this timestamp.
+
+    Example: GET /metrics?start_time=2026-09-01T00:00:00&end_time=2026-09-30T23:59:59
+
+    How filtering works:
+    We start with a base query and progressively add .filter() conditions.
+    Each .filter() appends a WHERE clause to the SQL query.
+    """
+    query = db.query(Metric)
+
+    if start_time:
+        query = query.filter(Metric.timestamp >= start_time)
+    if end_time:
+        query = query.filter(Metric.timestamp <= end_time)
+
+    # Order by newest first so the most recent data appears at the top
+    query = query.order_by(Metric.timestamp.desc())
+
+    return query.all()
+
+
+@app.get("/metrics/{endpoint_id}", response_model=list[MetricResponse])
+def get_metrics_by_endpoint(
+    endpoint_id: int,
+    start_time: Optional[datetime] = Query(None, description="Filter metrics after this time"),
+    end_time: Optional[datetime] = Query(None, description="Filter metrics before this time"),
+    db: Session = Depends(get_db),
+):
+    """
+    Get all metrics for a specific endpoint, optionally filtered by time range.
+
+    This is useful for examining one API's behavior over time.
+    Example: GET /metrics/1?start_time=2026-09-20T00:00:00
+    """
+    # Verify the endpoint exists
+    endpoint = db.query(Endpoint).filter(Endpoint.id == endpoint_id).first()
+    if not endpoint:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    query = db.query(Metric).filter(Metric.endpoint_id == endpoint_id)
+
+    if start_time:
+        query = query.filter(Metric.timestamp >= start_time)
+    if end_time:
+        query = query.filter(Metric.timestamp <= end_time)
+
+    query = query.order_by(Metric.timestamp.desc())
+
+    return query.all()

@@ -94,3 +94,24 @@ If asked about this project in an interview, focus on these key talking points:
 
 5. **Future Improvements?**
    "If I had more time, I would replace the SQLite/local DB with a time-series database like InfluxDB or Prometheus, which are better suited for massive volumes of metric data. I would also add real-time WebSocket streaming to the React dashboard instead of relying on HTTP polling."
+
+---
+
+## 🚀 Deployment
+
+PULSE is designed to be deployed as a single-instance application (due to its in-memory APScheduler). 
+
+### Required Environment Variables
+
+When deploying, you must configure the following environment variables:
+
+**Backend Environment Variables:**
+- `DATABASE_URL`: The connection string to your PostgreSQL database (e.g., `postgresql+psycopg://user:password@host:port/dbname`).
+- `ALLOWED_ORIGINS`: A comma-separated list of origins allowed to make API requests to the backend. In production, this should be the URL where your frontend is hosted (e.g., `https://pulse.my-domain.com`).
+
+**Frontend Environment Variables:**
+- `VITE_API_URL`: The public URL of your deployed backend API (e.g., `https://pulse-api.my-domain.com`). This ensures the frontend correctly routes API calls to the production server instead of localhost.
+
+### Startup Command
+For platforms using a `Procfile`, PULSE is configured to start with a single Uvicorn worker bound to the platform's port:
+`web: cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1`

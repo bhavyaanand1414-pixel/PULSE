@@ -4,17 +4,28 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text, func
 from datetime import datetime, timezone
 from typing import Optional
+import logging
 
-from database import get_db
+from database import get_db, SessionLocal
 from models import Endpoint, Metric, Anomaly, Incident
 from schemas import (
     EndpointCreate, EndpointResponse,
     MetricCreate, MetricResponse,
     AnomalyResponse,
     IncidentCreate, IncidentUpdate, IncidentResponse,
+    MonitoringRequest, MonitoringStatusResponse,
 )
 from detection import run_zscore_detection
 from ml_detection import run_isolation_forest_detection
+from monitor import (
+    start_monitoring, stop_monitoring,
+    get_monitoring_status, get_endpoint_monitor_status,
+    probe_endpoint, shutdown_scheduler, validate_monitor_url,
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("pulse.api")
 
 app = FastAPI(title="PULSE API")
 
@@ -26,6 +37,37 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Lifecycle Events ──────────────────────────────────────────────────────
+# These run when the server starts up and shuts down.
+
+@app.on_event("startup")
+def on_startup():
+    """
+    On server startup, resume monitoring for any endpoints that were
+    previously enabled. This handles server restarts gracefully.
+    """
+    db = SessionLocal()
+    try:
+        enabled = db.query(Endpoint).filter(Endpoint.monitoring_enabled == True).all()
+        for ep in enabled:
+            try:
+                start_monitoring(ep.id, ep.monitoring_interval)
+                logger.info(f"Resumed monitoring for '{ep.name}'")
+            except Exception as e:
+                logger.warning(f"Could not resume monitoring for '{ep.name}': {e}")
+        if enabled:
+            logger.info(f"Resumed {len(enabled)} monitoring job(s)")
+    finally:
+        db.close()
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    """Gracefully stop the background scheduler on server shutdown."""
+    shutdown_scheduler()
+    logger.info("PULSE API shutting down")
 
 # --- Root & Health Endpoints (existing) ---
 
@@ -63,11 +105,26 @@ def create_endpoint(endpoint_data: EndpointCreate, db: Session = Depends(get_db)
     new_endpoint = Endpoint(
         name=endpoint_data.name,
         url=endpoint_data.url,
-        created_at=datetime.now(timezone.utc)
+        created_at=datetime.now(timezone.utc),
+        monitoring_enabled=endpoint_data.monitoring_enabled,
+        monitoring_interval=endpoint_data.monitoring_interval,
     )
     db.add(new_endpoint)
     db.commit()
     db.refresh(new_endpoint)  # Reload to get the auto-generated id
+
+    # If monitoring was requested, start it immediately
+    if endpoint_data.monitoring_enabled:
+        try:
+            validate_monitor_url(endpoint_data.url)
+            start_monitoring(new_endpoint.id, endpoint_data.monitoring_interval)
+        except ValueError as e:
+            # URL validation failed — save the endpoint but disable monitoring
+            new_endpoint.monitoring_enabled = False
+            db.commit()
+            db.refresh(new_endpoint)
+            logger.warning(f"Endpoint created but monitoring not started: {e}")
+
     return new_endpoint
 
 
@@ -108,6 +165,8 @@ def delete_endpoint(endpoint_id: int, db: Session = Depends(get_db)):
     endpoint = db.query(Endpoint).filter(Endpoint.id == endpoint_id).first()
     if not endpoint:
         raise HTTPException(status_code=404, detail="Endpoint not found")
+    # Stop monitoring before deleting
+    stop_monitoring(endpoint_id)
     db.delete(endpoint)
     db.commit()
     return {"message": f"Endpoint '{endpoint.name}' deleted successfully"}
@@ -563,3 +622,117 @@ def system_health(db: Session = Depends(get_db)):
             "open_incidents": open_incidents,
         },
     }
+
+
+# --- Live Monitoring APIs ---
+
+@app.post("/monitoring/{endpoint_id}/start")
+def start_endpoint_monitoring(
+    endpoint_id: int,
+    request: MonitoringRequest = MonitoringRequest(),
+    db: Session = Depends(get_db),
+):
+    """
+    Start live monitoring for an endpoint.
+
+    PULSE will begin periodically sending GET requests to the endpoint's URL
+    and recording the actual response latency and status code.
+
+    The interval_seconds parameter controls how often probes are sent
+    (minimum 10s, maximum 300s, default 30s).
+    """
+    endpoint = db.query(Endpoint).filter(Endpoint.id == endpoint_id).first()
+    if not endpoint:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    # Validate URL safety before starting
+    try:
+        validate_monitor_url(endpoint.url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        result = start_monitoring(endpoint_id, request.interval_seconds)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Update endpoint record
+    endpoint.monitoring_enabled = True
+    endpoint.monitoring_interval = request.interval_seconds
+    db.commit()
+
+    return result
+
+
+@app.post("/monitoring/{endpoint_id}/stop")
+def stop_endpoint_monitoring(
+    endpoint_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Stop live monitoring for an endpoint.
+
+    The endpoint and all its collected metrics remain in the database;
+    only the periodic probing is stopped.
+    """
+    endpoint = db.query(Endpoint).filter(Endpoint.id == endpoint_id).first()
+    if not endpoint:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    result = stop_monitoring(endpoint_id)
+
+    # Update endpoint record
+    endpoint.monitoring_enabled = False
+    db.commit()
+
+    return result
+
+
+@app.post("/monitoring/{endpoint_id}/probe")
+def probe_endpoint_now(endpoint_id: int, db: Session = Depends(get_db)):
+    """
+    Trigger a single immediate probe of an endpoint.
+
+    Useful for testing: sends one GET request right now and records the result.
+    Does not require monitoring to be enabled.
+    """
+    endpoint = db.query(Endpoint).filter(Endpoint.id == endpoint_id).first()
+    if not endpoint:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    try:
+        validate_monitor_url(endpoint.url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    result = probe_endpoint(endpoint_id)
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    return result
+
+
+@app.get("/monitoring/status")
+def monitoring_status():
+    """
+    Get the status of all active monitoring jobs.
+
+    Returns a list of all endpoints that are currently being actively probed,
+    along with their polling intervals and next scheduled run times.
+    """
+    return get_monitoring_status()
+
+
+@app.get("/monitoring/{endpoint_id}/status", response_model=MonitoringStatusResponse)
+def endpoint_monitoring_status(endpoint_id: int, db: Session = Depends(get_db)):
+    """
+    Get monitoring status for a single endpoint.
+
+    Returns whether the endpoint is currently being monitored,
+    its polling interval, and when the next probe is scheduled.
+    """
+    endpoint = db.query(Endpoint).filter(Endpoint.id == endpoint_id).first()
+    if not endpoint:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    return get_endpoint_monitor_status(endpoint_id)

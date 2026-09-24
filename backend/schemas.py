@@ -20,9 +20,12 @@ class EndpointCreate(BaseModel):
     Schema for creating a new monitored endpoint.
     The client sends 'name' and 'url'. 
     The server will auto-generate 'id' and 'created_at'.
+    Optionally, the client can enable live monitoring immediately.
     """
     name: str
     url: str
+    monitoring_enabled: bool = False
+    monitoring_interval: int = 30  # seconds between probes
 
 
 class EndpointResponse(BaseModel):
@@ -38,6 +41,11 @@ class EndpointResponse(BaseModel):
     name: str
     url: str
     created_at: datetime
+    monitoring_enabled: bool
+    monitoring_interval: int
+    last_check_at: Optional[datetime]
+    last_status_code: Optional[int]
+    last_response_time: Optional[float]
 
     model_config = {"from_attributes": True}
 
@@ -58,6 +66,7 @@ class MetricCreate(BaseModel):
     is_error: Optional[bool] = None  # Auto-computed if not provided
     request_count: int = 1         # Defaults to 1 (single request)
     error_count: int = 0           # Defaults to 0
+    source: str = "demo"           # 'live' for real probes, 'demo' for simulated
 
     @model_validator(mode="after")
     def compute_is_error(self):
@@ -84,6 +93,7 @@ class MetricResponse(BaseModel):
     is_error: bool
     request_count: int
     error_count: int
+    source: str = "demo"
 
     model_config = {"from_attributes": True}
 
@@ -157,3 +167,22 @@ class IncidentResponse(BaseModel):
     resolved_at: Optional[datetime]
 
     model_config = {"from_attributes": True}
+
+
+# --- Monitoring Schemas ---
+
+class MonitoringRequest(BaseModel):
+    """
+    Schema for starting live monitoring on an endpoint.
+    """
+    interval_seconds: int = 30  # Polling interval (10-300 seconds)
+
+
+class MonitoringStatusResponse(BaseModel):
+    """
+    Schema for returning monitoring status.
+    """
+    endpoint_id: int
+    is_monitoring: bool
+    interval_seconds: Optional[int] = None
+    next_run: Optional[str] = None

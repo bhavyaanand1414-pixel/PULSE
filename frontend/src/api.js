@@ -24,6 +24,10 @@ async function apiFetch(path, options = {}) {
 // --- Endpoints ---
 export const getEndpoints = () => apiFetch("/endpoints");
 export const getEndpoint = (id) => apiFetch(`/endpoints/${id}`);
+export const createEndpoint = (data) =>
+  apiFetch("/endpoints", { method: "POST", body: JSON.stringify(data) });
+export const deleteEndpoint = (id) =>
+  apiFetch(`/endpoints/${id}`, { method: "DELETE" });
 
 // --- Metrics ---
 export const getMetrics = (params = {}) => {
@@ -61,3 +65,17 @@ export const resolveIncident = (id) =>
 
 // --- System Health ---
 export const getSystemHealth = () => apiFetch("/system/health");
+
+// --- Live Monitoring ---
+export const startMonitoring = (endpointId, intervalSeconds = 30) =>
+  apiFetch(`/monitoring/${endpointId}/start`, {
+    method: "POST",
+    body: JSON.stringify({ interval_seconds: intervalSeconds }),
+  });
+export const stopMonitoring = (endpointId) =>
+  apiFetch(`/monitoring/${endpointId}/stop`, { method: "POST" });
+export const probeEndpoint = (endpointId) =>
+  apiFetch(`/monitoring/${endpointId}/probe`, { method: "POST" });
+export const getMonitoringStatus = () => apiFetch("/monitoring/status");
+export const getEndpointMonitoringStatus = (endpointId) =>
+  apiFetch(`/monitoring/${endpointId}/status`);

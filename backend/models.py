@@ -25,6 +25,14 @@ class Endpoint(Base):
     url = Column(String, nullable=False)
     created_at = Column(DateTime, nullable=False)
 
+    # ── Live Monitoring Fields ─────────────────────────────────────────
+    # These control PULSE's active polling behavior for this endpoint.
+    monitoring_enabled = Column(Boolean, nullable=False, default=False)
+    monitoring_interval = Column(Integer, nullable=False, default=30)  # seconds
+    last_check_at = Column(DateTime, nullable=True)      # last probe timestamp
+    last_status_code = Column(Integer, nullable=True)     # last probe HTTP status
+    last_response_time = Column(Float, nullable=True)     # last probe latency ms
+
     # relationship() creates a Python-level link between Endpoint and its Metrics.
     # It does NOT create a database column — it lets you do: endpoint.metrics
     # to get all Metric rows belonging to this endpoint.
@@ -65,6 +73,10 @@ class Metric(Base):
     is_error = Column(Boolean, nullable=False)           # True if status_code >= 400
     request_count = Column(Integer, nullable=False)      # Requests in this time window
     error_count = Column(Integer, nullable=False, default=0)  # Errors in this time window
+
+    # Source: 'live' for real probes, 'demo' for simulated data
+    # This lets the dashboard clearly distinguish real vs simulated metrics.
+    source = Column(String, nullable=False, default="demo")
 
     # back_populates creates the reverse link: metric.endpoint gives the Endpoint object.
     endpoint = relationship("Endpoint", back_populates="metrics")

@@ -412,7 +412,116 @@ def detect_anomalies_ml(endpoint_id: int, db: Session = Depends(get_db)):
         "new_anomalies_detected": len(new_anomalies),
         "by_severity": severity_counts,
     }
+def create_or_update_incident_from_anomalies(
+    db: Session,
+    endpoint: Endpoint,
+    anomalies: list
+):
+    """
+    Create or update a single incident for a group of newly detected anomalies.
 
+    Multiple anomalies from the same detection run are grouped into one
+    trackable incident instead of creating one incident per anomaly.
+    """
+
+    if not anomalies:
+        return None
+
+    # Severity ranking so we can find the worst anomaly
+    severity_rank = {
+        "LOW": 1,
+        "MEDIUM": 2,
+        "HIGH": 3,
+        "CRITICAL": 4,
+    }
+
+    # Find the highest severity
+    highest_severity = max(
+        anomalies,
+        key=lambda a: severity_rank.get(a.severity.upper(), 0)
+    ).severity.upper()
+
+    # Find which detection methods were involved
+    detection_methods = sorted(
+        set(
+            a.detection_method
+            for a in anomalies
+            if a.detection_method
+        )
+    )
+
+    # Find affected metric types
+    metric_types = sorted(
+        set(
+            a.metric_type
+            for a in anomalies
+            if a.metric_type
+        )
+    )
+
+    # Check whether this endpoint already has an active incident
+    existing_incident = (
+        db.query(Incident)
+        .filter(
+            Incident.endpoint_id == endpoint.id,
+            Incident.status.in_(["OPEN", "INVESTIGATING"])
+        )
+        .order_by(Incident.created_at.desc())
+        .first()
+    )
+
+    now = datetime.now(timezone.utc)
+
+    if existing_incident:
+        # Reuse the existing incident instead of creating a duplicate.
+        existing_rank = severity_rank.get(
+            existing_incident.severity.upper(), 0
+        )
+
+        new_rank = severity_rank.get(highest_severity, 0)
+
+        if new_rank > existing_rank:
+            existing_incident.severity = highest_severity
+
+        existing_incident.updated_at = now
+
+        existing_incident.description = (
+            f"Endpoint: {endpoint.name}\n"
+            f"Detection methods: {', '.join(detection_methods)}\n"
+            f"Affected metrics: {', '.join(metric_types)}\n"
+            f"New anomalies detected: {len(anomalies)}\n"
+            f"Highest severity: {highest_severity}\n"
+            f"Incident status: {existing_incident.status}"
+        )
+
+        db.commit()
+        db.refresh(existing_incident)
+
+        return existing_incident
+
+    # No active incident exists, so create one.
+    new_incident = Incident(
+        title=f"{highest_severity.title()} anomaly detected — {endpoint.name}",
+        description=(
+            f"Endpoint: {endpoint.name}\n"
+            f"Detection methods: {', '.join(detection_methods)}\n"
+            f"Affected metrics: {', '.join(metric_types)}\n"
+            f"Anomalies grouped: {len(anomalies)}\n"
+            f"Highest severity: {highest_severity}"
+        ),
+        severity=highest_severity,
+        status="OPEN",
+        endpoint_id=endpoint.id,
+        created_at=now,
+        updated_at=now,
+        resolved_at=None,
+    )
+
+    db.add(new_incident)
+    db.commit()
+    db.refresh(new_incident)
+
+    return new_incident
 
 @app.post("/anomalies/detect/hybrid/{endpoint_id}")
 def detect_anomalies_hybrid(endpoint_id: int, db: Session = Depends(get_db)):
@@ -436,7 +545,43 @@ def detect_anomalies_hybrid(endpoint_id: int, db: Session = Depends(get_db)):
         ml_anomalies = run_isolation_forest_detection(db, endpoint_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+       # Combine newly detected anomalies
+    all_anomalies = zscore_anomalies + ml_anomalies
 
+    if all_anomalies:
+        # New anomalies were detected: create or update an incident
+        incident = create_or_update_incident_from_anomalies(
+            db=db,
+            endpoint=endpoint,
+            anomalies=all_anomalies,
+        )
+
+    else:
+        # No new anomalies: check whether an active incident exists
+        incident = (
+            db.query(Incident)
+            .filter(
+                Incident.endpoint_id == endpoint_id,
+                Incident.status.in_(["OPEN", "INVESTIGATING"]),
+            )
+            .order_by(Incident.created_at.desc())
+            .first()
+        )
+
+        # If there is no active incident, use existing anomaly records
+        # to create the initial incident.
+        if incident is None:
+            stored_anomalies = (
+                db.query(Anomaly)
+                .filter(Anomaly.endpoint_id == endpoint_id)
+                .all()
+            )
+
+            incident = create_or_update_incident_from_anomalies(
+                db=db,
+                endpoint=endpoint,
+                anomalies=stored_anomalies,
+            )
     # Build severity counts for each method
     zscore_counts = {}
     for a in zscore_anomalies:
@@ -458,7 +603,13 @@ def detect_anomalies_hybrid(endpoint_id: int, db: Session = Depends(get_db)):
             "new_anomalies": len(ml_anomalies),
             "by_severity": ml_counts,
         },
-        "total_new_anomalies": len(zscore_anomalies) + len(ml_anomalies),
+        "total_new_anomalies": len(all_anomalies),
+        "incident": {
+            "created_or_updated": incident is not None,
+            "incident_id": incident.id if incident else None,
+            "severity": incident.severity if incident else None,
+            "status": incident.status if incident else None,
+        },
     }
 
 
